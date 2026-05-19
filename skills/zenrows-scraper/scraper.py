@@ -394,7 +394,7 @@ def _phase_style(phase, basic_mode):
         return "red", "Phase 3: JS retry"
     if phase == 1:
         return "blue", "Phase 1: Scraping"
-    return "red", "Phase 3: JS retry"
+    return "red", "Phase 2: JS retry"
 
 
 def _postfix_str(ok, fail, dd, cf, done, total, elapsed):
@@ -405,7 +405,7 @@ def _postfix_str(ok, fail, dd, cf, done, total, elapsed):
         eta_min = max(0, int((total - done) / rate_per_sec / 60))
         eta = f"{eta_min}min"
     else:
-        eta = "??"
+        eta = "calculating..."
     return (
         f"OK: {ok:,} ✅ | "
         f"Failed: {fail:,} ❌ | "
@@ -868,13 +868,13 @@ def main():
 
         # PHASE 2 removed in v3.0: same-settings retry never recovered rows.
 
-        # PHASE 3: JS render + premium proxy on remaining failures.
+        # PHASE 2: JS render + premium proxy on remaining failures.
         failures_final = failures_1
         if failures_1 and not _stop_requested.is_set():
             stats_3, failures_final = run_phase(
                 api_key, failures_1,
                 concurrency=min(25, concurrency),
-                js_render=True, premium=True, phase=3,
+                js_render=True, premium=True, phase=2,
                 cache=cache,
                 output_path=output_path,
                 out_headers=out_headers,
