@@ -96,17 +96,23 @@ instructions and exit. In that case, tell the user to run:
 
 then close and reopen the terminal, and try again.
 
-STEP 3 — Run the script immediately
-------------------------------------
-Run, with bash syntax, exactly:
+STEP 3 — Run the script immediately (FOREGROUND)
+-------------------------------------------------
+Run directly in the terminal, exactly:
 
-    ZENROWS_API_KEY="$ZENROWS_API_KEY" python "{csv_folder}/scraper.py" "{csv_path}" --concurrency 30
+    python "{csv_folder}/scraper.py" "{csv_path}" --concurrency 30
+
+This MUST run in the foreground so the user can see the live
+tqdm progress bar. Do NOT use Start-Process, do NOT pass
+-WindowStyle Hidden, and do NOT background the process with
+& or any other method. Run it directly in the terminal as
+shown above.
 
 Notes:
 - {csv_path} uses forward slashes.
 - The CSV path is positional. Do NOT pass --csv-path.
-- The API key is taken from the environment. Do NOT pass it
-  as an argument.
+- The API key is taken from the environment (ZENROWS_API_KEY).
+  Do NOT pass it as an argument.
 - Default concurrency is 30. Hard cap is 40 (see "Concurrency
   Limits" below).
 
@@ -115,7 +121,7 @@ Optional flags:
   (see "Basic Mode" section below). Default concurrency in this
   mode is 40. Example:
 
-      ZENROWS_API_KEY="$ZENROWS_API_KEY" python "{csv_folder}/scraper.py" "{csv_path}" --basic-mode
+      python "{csv_folder}/scraper.py" "{csv_path}" --basic-mode
 
 - --concurrency N : override Phase 1 concurrency. Phase 2/3
   (basic mode) and Phase 3 (default mode) clamp themselves to
@@ -224,6 +230,12 @@ WHAT THE SCRIPT DOES (reference only — do not reimplement)
 ================================================================
 PROGRESS DISPLAY
 ================================================================
+IMPORTANT: Always run scraper.py in foreground, not background.
+Running in background hides the tqdm progress bar. Claude Code
+must NOT use Start-Process with -WindowStyle Hidden or any
+background execution method. Run directly in the terminal so
+the user can see the live progress bar.
+
 Default mode prints:
 
     Phase 1: Scraping X/Y | OK: A | CF: C | DD: D | Failed: B | ETA: Xmin
