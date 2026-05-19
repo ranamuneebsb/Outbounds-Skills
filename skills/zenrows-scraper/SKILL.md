@@ -1,14 +1,23 @@
 SKILL NAME: ZenRows Website Scraper
-VERSION: 3.0
+VERSION: 3.1
 AUTHOR: OlympoLabs
 
 DESCRIPTION:
 Scrapes homepage content for every company in a CSV using the
 ZenRows API. Auto-detects website and company name columns.
-Two-phase flow only: Phase 1 (main scrape at user concurrency,
-default 30, hard cap 40) and Phase 3 (JS render retry at
-concurrency 25 on Phase 1 failures). Phase 2 was removed in
-v3.0 because identical-settings retries never recovered rows.
+
+Two modes:
+- Default (no flag): 2-phase flow. Phase 1 (main scrape at user
+  concurrency, default 30, hard cap 40, antibot+autoparse on) and
+  Phase 3 (JS+premium retry at concurrency 25 on Phase 1 failures).
+  Phase 2 was removed in v3.0 because identical-settings retries
+  never recovered rows.
+- --basic-mode: 3-phase cost-optimized flow. Phase 1 is a cheap
+  basic request (autoparse=false, antibot=false, $0.00013/req,
+  concurrency 40); Phase 2 retries failures with antibot+autoparse
+  at concurrency 30; Phase 3 retries Phase 2 failures with full
+  JS+premium at concurrency 30.
+
 The scraper is already implemented as scraper.py in this repo.
 Claude Code DOWNLOADS and RUNS that file. It does NOT rewrite,
 regenerate, or "improve" it.
@@ -101,6 +110,19 @@ Notes:
 - Default concurrency is 30. Hard cap is 40 (see "Concurrency
   Limits" below).
 
+Optional flags:
+- --basic-mode : switch to the 3-phase cost-optimized flow
+  (see "Basic Mode" section below). Default concurrency in this
+  mode is 40. Example:
+
+      ZENROWS_API_KEY="$ZENROWS_API_KEY" python "{csv_folder}/scraper.py" "{csv_path}" --basic-mode
+
+- --concurrency N : override Phase 1 concurrency. Phase 2/3
+  (basic mode) and Phase 3 (default mode) clamp themselves to
+  this value when it's lower than their per-phase cap.
+- --force : skip the 15-minute restart cooldown (only after
+  probe_resume.py confirms the WAF is clear — see Restart Rules).
+
 ================================================================
 RESTART RULES — READ BEFORE STOPPING OR RESTARTING
 ================================================================
@@ -165,13 +187,15 @@ WHAT THE SCRIPT DOES (reference only — do not reimplement)
 ================================================================
 - Auto-detects website and company columns from CSV headers.
 - Normalizes URLs (adds https://, strips www., strips trailing /).
-- Phase 1: scrape all rows concurrently at user concurrency
-  (default 30) with autoparse=true, antibot=true,
-  js_render=false, collect failures.
-- Phase 3: retry Phase 1 failures with js_render=true and
-  premium_proxy=true at concurrency 25. Anything still failing
-  is marked scrape_failed. (Phase 2 — same-settings retry —
-  was removed; it never recovered rows.)
+- DEFAULT MODE (no flag):
+  - Phase 1: scrape all rows concurrently at user concurrency
+    (default 30) with autoparse=true, antibot=true,
+    js_render=false, premium_proxy=false; collect failures.
+  - Phase 3: retry Phase 1 failures with js_render=true and
+    premium_proxy=true at concurrency 25. Anything still failing
+    is marked scrape_failed. (Phase 2 — same-settings retry —
+    was removed; it never recovered rows.)
+- BASIC MODE (--basic-mode): see "BASIC MODE" section below.
 - Cache: scrape_cache.db (SQLite, WAL mode) saved next to the
   input CSV. Loads 70k entries in <0.5s and uses ~50 MB RAM
   (previous CSV cache loaded in 7 min and used 6-7 GB).
@@ -200,7 +224,7 @@ WHAT THE SCRIPT DOES (reference only — do not reimplement)
 ================================================================
 PROGRESS DISPLAY
 ================================================================
-The script prints these lines as it runs:
+Default mode prints:
 
     Phase 1: Scraping X/Y | OK: A | CF: C | DD: D | Failed: B | ETA: Xmin
     Phase 3: JS retry X rows | New OK: A | Final failed: B
@@ -209,6 +233,53 @@ The script prints these lines as it runs:
 CF = cloudflare_blocked, DD = dead_domain. Both are cached
 permanently and written to the output CSV (just with empty
 homepage_content) — they are NOT counted as failures.
+
+--basic-mode prints (CF folded into "Failed" so Phase 2 / 3 can
+retry it with stronger settings):
+
+    Phase 1: Scraping X/Y | OK: A | DD: B | Failed: C | ETA: Xmin
+    Phase 2: Antibot retry X rows | New OK: A | Still failed: B
+    Phase 3: JS retry X rows | New OK: A | Final failed: B
+    Done: Total OK: X | Total Failed: Y | Saved to: [path]
+
+================================================================
+BASIC MODE (--basic-mode)
+================================================================
+Use this when the site list is dominated by domains without
+aggressive bot protection (most B2B / SaaS marketing pages).
+Phase 1 trades robustness for ~10x lower per-request cost; the
+two later phases recover anything Phase 1 missed.
+
+PHASE 1 — cheap basic scrape
+  autoparse=false, antibot=false, js_render=false,
+  premium_proxy=false. Concurrency 40 (default). Cost:
+  $0.00013 per request. Returns raw HTML for sites that respond
+  without any bot challenge. CF blocks here are NOT cached as
+  permanent verdicts — they go into the Phase 2 retry pool.
+  homepage_status for OKs from this phase is `ok_basic`.
+
+PHASE 2 — antibot retry
+  autoparse=true, antibot=true, js_render=false,
+  premium_proxy=false. Concurrency 30 (clamps to --concurrency
+  if lower). Retries every Phase 1 failure (including CF blocks).
+  homepage_status for OKs from this phase is `ok`.
+
+PHASE 3 — full-stack retry
+  autoparse=true, antibot=true, js_render=true,
+  premium_proxy=true. Concurrency 30 (clamps to --concurrency
+  if lower). Retries every Phase 2 failure. CF blocks here ARE
+  cached permanent (last-resort). Anything still failing after
+  Phase 3 is written with homepage_status = `scrape_failed`.
+  homepage_status for OKs from this phase is `ok_js`.
+
+Notes:
+- The cache phase column stores 1, 2, or 3 — useful for telling
+  raw-HTML Phase-1 rows from autoparsed Phase-2/3 rows.
+- dead_domain is detected and cached permanent in every phase
+  (it's a ZenRows verdict, not affected by antibot/JS).
+- Restart rules and the 15-minute cooldown apply identically to
+  both modes — they're about ZenRows' edge WAF, not the request
+  settings.
 
 ================================================================
 TROUBLESHOOTING
