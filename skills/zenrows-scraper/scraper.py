@@ -1,20 +1,13 @@
 """
-ZenRows Website Scraper - default 2-phase flow, or 3-phase --basic-mode flow.
+ZenRows Website Scraper - 3-phase cost-optimized flow.
 
-Default mode (unchanged from v3.0):
   Phase 1 at user concurrency (default 30, hard cap 40):
+    autoparse=false, antibot=false, js_render=false, premium_proxy=false.
+    Cost: $0.00013 per request. CF blocks here are retried in Phase 2.
+  Phase 2 at concurrency 25 on Phase 1 failures:
     autoparse=true, antibot=true, js_render=false, premium_proxy=false.
-  Phase 3 at concurrency 25 on Phase 1 failures:
-    js_render=true, premium_proxy=true (autoparse+antibot still on).
-  Phase 2 was removed in v3.0 — identical-settings retries never
-  recovered additional rows.
-
---basic-mode (3-phase, cost-optimized for sites without bot protection):
-  Phase 1 at concurrency 40 (default): autoparse=false, antibot=false,
-    js_render=false, premium_proxy=false. Cost: $0.00013 per request.
-  Phase 2 at concurrency 30 on Phase 1 failures: autoparse=true,
-    antibot=true (still no JS/premium).
-  Phase 3 at concurrency 30 on Phase 2 failures: full stack —
+    CF blocks here are retried in Phase 3.
+  Phase 3 at concurrency 25 on Phase 2 failures: full stack —
     autoparse=true, antibot=true, js_render=true, premium_proxy=true.
   Anything still failing after Phase 3 is marked scrape_failed.
 
@@ -384,17 +377,13 @@ def append_output(output_path, headers, row):
         f.flush()
 
 
-def _phase_style(phase, basic_mode):
+def _phase_style(phase):
     """Return (tqdm colour, descriptive label) for a phase."""
-    if basic_mode:
-        if phase == 1:
-            return "blue", "Phase 1: Scraping"
-        if phase == 2:
-            return "yellow", "Phase 2: Antibot retry"
-        return "red", "Phase 3: JS retry"
     if phase == 1:
         return "blue", "Phase 1: Scraping"
-    return "red", "Phase 2: JS retry"
+    if phase == 2:
+        return "yellow", "Phase 2: Antibot retry"
+    return "red", "Phase 3: JS retry"
 
 
 def _postfix_str(ok, fail, dd, cf, done, total, elapsed):
@@ -458,7 +447,7 @@ def _print_phase_summary(phase, ok, fail, dd, cf, elapsed):
 def run_phase(api_key, rows, concurrency, js_render, premium, phase, cache,
               output_path, out_headers, *,
               autoparse=True, antibot=True,
-              ok_status=None, cf_retryable=False, basic_mode=False,
+              ok_status=None, cf_retryable=False,
               progress_path=None):
     """Streaming-writes variant: calls write_success_row inline as each future
     completes so HTML content doesn't accumulate in memory. Returns
@@ -477,13 +466,12 @@ def run_phase(api_key, rows, concurrency, js_render, premium, phase, cache,
     write_success_row) so steady-state RAM stays at 1-3 GB on 300k-row runs.
 
     cf_retryable=True folds cloudflare_blocked into the failures bucket so
-    the next phase can retry with stronger settings (used by basic-mode
-    Phases 1 and 2). cf_retryable=False (default) caches CF as a permanent
-    verdict, matching default-mode behavior.
+    the next phase can retry with stronger settings (used by Phases 1 and 2).
+    cf_retryable=False (Phase 3) caches CF as a permanent verdict.
     """
     failures = []
     total = len(rows)
-    colour, label = _phase_style(phase, basic_mode)
+    colour, label = _phase_style(phase)
     if total == 0:
         return {"ok": 0, "fail": 0, "cf": 0, "dd": 0, "elapsed": 0.0}, failures
 
@@ -652,17 +640,7 @@ def main():
     parser.add_argument("csv_path", help="Path to input CSV")
     parser.add_argument(
         "--concurrency", type=int, default=None,
-        help=f"Phase 1 concurrency (1-{MAX_CONCURRENCY}, default 30, "
-             f"or 40 with --basic-mode)",
-    )
-    parser.add_argument(
-        "--basic-mode", action="store_true",
-        help="3-phase cost-optimized flow. Phase 1: cheap basic scrape "
-             "(autoparse=false, antibot=false, ~$0.00013/req, concurrency 40). "
-             "Phase 2: antibot retry on Phase 1 failures (concurrency 30). "
-             "Phase 3: JS+premium retry on Phase 2 failures (concurrency 30). "
-             "Default flow (without this flag) is unchanged: Phase 1 with "
-             "antibot+autoparse, then Phase 3 JS retry.",
+        help=f"Phase 1 concurrency (1-{MAX_CONCURRENCY}, default 30).",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -677,7 +655,7 @@ def main():
 
     csv_path = args.csv_path
     if args.concurrency is None:
-        requested = 40 if args.basic_mode else 30
+        requested = 30
     else:
         requested = max(1, args.concurrency)
     if requested > MAX_CONCURRENCY:
@@ -798,89 +776,55 @@ def main():
     scrape_start = time.time()
 
     phase_stats_list = []
-    if args.basic_mode:
-        # --basic-mode: 3-phase cost-optimized flow.
-        # PHASE 1: cheap basic scrape (autoparse=false, antibot=false,
-        # no JS, no premium). ~$0.00013/request. CF blocks are folded
-        # into failures so Phase 2 retries them with antibot=true.
-        stats_1, failures_1 = run_phase(
-            api_key, fresh_rows,
-            concurrency=concurrency,
-            js_render=False, premium=False, phase=1,
+    # PHASE 1: cheap basic scrape (autoparse=false, antibot=false,
+    # no JS, no premium). ~$0.00013/request. CF blocks are folded
+    # into failures so Phase 2 retries them with antibot=true.
+    stats_1, failures_1 = run_phase(
+        api_key, fresh_rows,
+        concurrency=concurrency,
+        js_render=False, premium=False, phase=1,
+        cache=cache,
+        output_path=output_path,
+        out_headers=out_headers,
+        autoparse=False, antibot=False,
+        ok_status="ok_basic", cf_retryable=True,
+        progress_path=progress_path,
+    )
+    phase_stats_list.append(stats_1)
+
+    # PHASE 2: antibot retry on Phase 1 failures (autoparse=true,
+    # antibot=true, no JS/premium). CF still retryable for Phase 3.
+    failures_2 = failures_1
+    if failures_1 and not _stop_requested.is_set():
+        stats_2, failures_2 = run_phase(
+            api_key, failures_1,
+            concurrency=min(25, concurrency),
+            js_render=False, premium=False, phase=2,
             cache=cache,
             output_path=output_path,
             out_headers=out_headers,
-            autoparse=False, antibot=False,
-            ok_status="ok_basic", cf_retryable=True,
-            basic_mode=True,
+            autoparse=True, antibot=True,
+            ok_status="ok", cf_retryable=True,
             progress_path=progress_path,
         )
-        phase_stats_list.append(stats_1)
+        phase_stats_list.append(stats_2)
 
-        # PHASE 2: antibot retry on Phase 1 failures (autoparse=true,
-        # antibot=true, no JS/premium). CF still retryable for Phase 3.
-        failures_2 = failures_1
-        if failures_1 and not _stop_requested.is_set():
-            stats_2, failures_2 = run_phase(
-                api_key, failures_1,
-                concurrency=min(30, concurrency),
-                js_render=False, premium=False, phase=2,
-                cache=cache,
-                output_path=output_path,
-                out_headers=out_headers,
-                autoparse=True, antibot=True,
-                ok_status="ok", cf_retryable=True,
-                basic_mode=True,
-                progress_path=progress_path,
-            )
-            phase_stats_list.append(stats_2)
-
-        # PHASE 3: full-stack retry on Phase 2 failures (autoparse+antibot
-        # +JS+premium). Last chance — CF here is cached permanent.
-        failures_final = failures_2
-        if failures_2 and not _stop_requested.is_set():
-            stats_3, failures_final = run_phase(
-                api_key, failures_2,
-                concurrency=min(30, concurrency),
-                js_render=True, premium=True, phase=3,
-                cache=cache,
-                output_path=output_path,
-                out_headers=out_headers,
-                autoparse=True, antibot=True,
-                ok_status="ok_js", cf_retryable=False,
-                basic_mode=True,
-                progress_path=progress_path,
-            )
-            phase_stats_list.append(stats_3)
-    else:
-        # Default 2-phase flow (unchanged from v3.0).
-        # PHASE 1 (streaming writes — content is flushed to disk per-future)
-        stats_1, failures_1 = run_phase(
-            api_key, fresh_rows,
-            concurrency=concurrency,
-            js_render=False, premium=False, phase=1,
+    # PHASE 3: full-stack retry on Phase 2 failures (autoparse+antibot
+    # +JS+premium). Last chance — CF here is cached permanent.
+    failures_final = failures_2
+    if failures_2 and not _stop_requested.is_set():
+        stats_3, failures_final = run_phase(
+            api_key, failures_2,
+            concurrency=min(25, concurrency),
+            js_render=True, premium=True, phase=3,
             cache=cache,
             output_path=output_path,
             out_headers=out_headers,
+            autoparse=True, antibot=True,
+            ok_status="ok_js", cf_retryable=False,
             progress_path=progress_path,
         )
-        phase_stats_list.append(stats_1)
-
-        # PHASE 2 removed in v3.0: same-settings retry never recovered rows.
-
-        # PHASE 2: JS render + premium proxy on remaining failures.
-        failures_final = failures_1
-        if failures_1 and not _stop_requested.is_set():
-            stats_3, failures_final = run_phase(
-                api_key, failures_1,
-                concurrency=min(25, concurrency),
-                js_render=True, premium=True, phase=2,
-                cache=cache,
-                output_path=output_path,
-                out_headers=out_headers,
-                progress_path=progress_path,
-            )
-            phase_stats_list.append(stats_3)
+        phase_stats_list.append(stats_3)
 
     for row in failures_final:
         row.update({
