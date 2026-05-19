@@ -23,6 +23,7 @@ See SKILL.md for the full spec and operational rules
 """
 import argparse
 import csv
+import json
 import os
 import signal
 import sqlite3
@@ -33,6 +34,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 import requests
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    import subprocess
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "tqdm", "-q"]
+    )
+    from tqdm import tqdm
 
 csv.field_size_limit(sys.maxsize)
 
@@ -374,45 +384,90 @@ def append_output(output_path, headers, row):
         f.flush()
 
 
-def progress_line(phase, done, total, ok, fail, cf, dd, start, *,
-                  basic_mode=False):
-    elapsed = time.time() - start
-    rate = done / elapsed if elapsed > 0 else 0
-    remaining = (total - done) / rate if rate > 0 else 0
-    eta = f"{remaining / 60:.1f}min"
+def _phase_style(phase, basic_mode):
+    """Return (tqdm colour, descriptive label) for a phase."""
     if basic_mode:
         if phase == 1:
-            return (
-                f"\rPhase 1: Scraping {done}/{total} | "
-                f"OK: {ok} | DD: {dd} | Failed: {fail} | ETA: {eta}"
-            )
+            return "blue", "Phase 1: Scraping"
         if phase == 2:
-            return (
-                f"\rPhase 2: Antibot retry {done}/{total} rows | "
-                f"New OK: {ok} | Still failed: {fail}"
-            )
-        return (
-            f"\rPhase 3: JS retry {done}/{total} rows | "
-            f"New OK: {ok} | Final failed: {fail}"
-        )
+            return "yellow", "Phase 2: Antibot retry"
+        return "red", "Phase 3: JS retry"
     if phase == 1:
-        return (
-            f"\rPhase 1: Scraping {done}/{total} | "
-            f"OK: {ok} | CF: {cf} | DD: {dd} | Failed: {fail} | ETA: {eta}"
-        )
+        return "blue", "Phase 1: Scraping"
+    return "red", "Phase 3: JS retry"
+
+
+def _postfix_str(ok, fail, dd, cf, done, total, elapsed):
+    """Build the postfix shown after the tqdm bar."""
+    rate_per_sec = done / elapsed if elapsed > 0 else 0
+    speed_per_min = int(round(rate_per_sec * 60))
+    if rate_per_sec > 0:
+        eta_min = max(0, int((total - done) / rate_per_sec / 60))
+        eta = f"{eta_min}min"
+    else:
+        eta = "??"
     return (
-        f"\rPhase 3: JS retry {done}/{total} rows | "
-        f"New OK: {ok} | Final failed: {fail}"
+        f"OK: {ok:,} ✅ | "
+        f"Failed: {fail:,} ❌ | "
+        f"DD: {dd:,} \U0001F480 | "
+        f"CF: {cf:,} \U0001F6AB | "
+        f"ETA: {eta} | "
+        f"Speed: {speed_per_min}/min"
+    )
+
+
+def _write_progress_json(progress_path, phase, phase_label, done, total,
+                         ok, fail, dd, cf, start):
+    if not progress_path:
+        return
+    elapsed = time.time() - start
+    rate_per_sec = done / elapsed if elapsed > 0 else 0
+    eta_sec = (total - done) / rate_per_sec if rate_per_sec > 0 else 0
+    data = {
+        "phase": phase,
+        "phase_label": phase_label,
+        "done": done,
+        "total": total,
+        "ok": ok,
+        "failed": fail,
+        "dd": dd,
+        "cf": cf,
+        "elapsed_min": round(elapsed / 60, 1),
+        "eta_min": int(round(eta_sec / 60)),
+        "speed_per_min": int(round(rate_per_sec * 60)),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    try:
+        tmp_path = progress_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, progress_path)
+    except OSError:
+        pass
+
+
+def _print_phase_summary(phase, ok, fail, dd, cf, elapsed):
+    elapsed_min = max(0, int(round(elapsed / 60)))
+    print(
+        f"Phase {phase} done: OK={ok:,} | Failed={fail:,} | "
+        f"DD={dd:,} | CF={cf:,} | Time={elapsed_min}min",
+        flush=True,
     )
 
 
 def run_phase(api_key, rows, concurrency, js_render, premium, phase, cache,
               output_path, out_headers, *,
               autoparse=True, antibot=True,
-              ok_status=None, cf_retryable=False, basic_mode=False):
+              ok_status=None, cf_retryable=False, basic_mode=False,
+              progress_path=None):
     """Streaming-writes variant: calls write_success_row inline as each future
     completes so HTML content doesn't accumulate in memory. Returns
-    (n_successes, failures). failures is a list of un-scraped rows.
+    (stats_dict, failures). stats_dict has keys ok, fail, cf, dd, elapsed.
+
+    Drives a tqdm progress bar coloured per phase (blue/yellow/red) and
+    updates the postfix on every completed future. The progress.json file
+    is rewritten every 100 rows so an external watcher (e.g. Claude Code)
+    can poll the run state without scraping the terminal.
 
     The streaming pattern is load-bearing for memory. The original
     implementation accumulated all OK rows into a `successes` list and
@@ -428,8 +483,9 @@ def run_phase(api_key, rows, concurrency, js_render, premium, phase, cache,
     """
     failures = []
     total = len(rows)
+    colour, label = _phase_style(phase, basic_mode)
     if total == 0:
-        return 0, failures
+        return {"ok": 0, "fail": 0, "cf": 0, "dd": 0, "elapsed": 0.0}, failures
 
     if ok_status is None:
         ok_status = "ok_js" if js_render else "ok"
@@ -451,60 +507,86 @@ def run_phase(api_key, rows, concurrency, js_render, premium, phase, cache,
         )
         return row, url, status, content, err
 
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futures = [ex.submit(task, r) for r in rows]
-        for fut in as_completed(futures):
-            row, url, status, content, _err = fut.result()
-            done += 1
-            if status == "ok":
-                ok += 1
-                cache_row = {
-                    "url": url,
-                    "status": ok_status,
-                    "content_length": len(content),
-                    "phase": phase,
-                    "content": content,
-                }
-                cache[url] = cache_row
-                write_success_row(row, cache_row, output_path, out_headers)
-            elif status == "cloudflare_blocked":
-                if cf_retryable:
-                    fail += 1
-                    failures.append(row)
-                else:
-                    cf += 1
+    pbar = tqdm(
+        total=total,
+        desc=label,
+        bar_format="{desc} [{bar:20}] {n:>6,}/{total:,} | {postfix}",
+        ascii="░█",  # ░ for empty, █ for full
+        colour=colour,
+        unit="row",
+        leave=True,
+        mininterval=0.1,
+        smoothing=0.1,
+    )
+    pbar.set_postfix_str(_postfix_str(0, 0, 0, 0, 0, total, 0), refresh=True)
+
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            futures = [ex.submit(task, r) for r in rows]
+            for fut in as_completed(futures):
+                row, url, status, content, _err = fut.result()
+                done += 1
+                if status == "ok":
+                    ok += 1
                     cache_row = {
                         "url": url,
-                        "status": "cloudflare_blocked",
+                        "status": ok_status,
+                        "content_length": len(content),
+                        "phase": phase,
+                        "content": content,
+                    }
+                    cache[url] = cache_row
+                    write_success_row(row, cache_row, output_path, out_headers)
+                elif status == "cloudflare_blocked":
+                    if cf_retryable:
+                        fail += 1
+                        failures.append(row)
+                    else:
+                        cf += 1
+                        cache_row = {
+                            "url": url,
+                            "status": "cloudflare_blocked",
+                            "content_length": 0,
+                            "phase": phase,
+                            "content": "",
+                        }
+                        cache[url] = cache_row
+                        write_success_row(row, cache_row, output_path, out_headers)
+                elif status == "dead_domain":
+                    dd += 1
+                    cache_row = {
+                        "url": url,
+                        "status": "dead_domain",
                         "content_length": 0,
                         "phase": phase,
                         "content": "",
                     }
                     cache[url] = cache_row
                     write_success_row(row, cache_row, output_path, out_headers)
-            elif status == "dead_domain":
-                dd += 1
-                cache_row = {
-                    "url": url,
-                    "status": "dead_domain",
-                    "content_length": 0,
-                    "phase": phase,
-                    "content": "",
-                }
-                cache[url] = cache_row
-                write_success_row(row, cache_row, output_path, out_headers)
-            elif status == "stopped":
-                failures.append(row)
-            else:
-                fail += 1
-                failures.append(row)
+                elif status == "stopped":
+                    failures.append(row)
+                else:
+                    fail += 1
+                    failures.append(row)
 
-            if done % 5 == 0 or done == total:
-                print(progress_line(phase, done, total, ok, fail, cf, dd,
-                                    start, basic_mode=basic_mode),
-                      end="", flush=True)
-    print()
-    return ok + cf + dd, failures
+                elapsed = time.time() - start
+                pbar.set_postfix_str(
+                    _postfix_str(ok, fail, dd, cf, done, total, elapsed),
+                    refresh=False,
+                )
+                pbar.update(1)
+
+                if done % 100 == 0 or done == total:
+                    _write_progress_json(
+                        progress_path, phase, label, done, total,
+                        ok, fail, dd, cf, start,
+                    )
+    finally:
+        pbar.close()
+
+    elapsed = time.time() - start
+    _print_phase_summary(phase, ok, fail, dd, cf, elapsed)
+    return {"ok": ok, "fail": fail, "cf": cf, "dd": dd, "elapsed": elapsed}, failures
 
 
 def write_success_row(row, cache_row, output_path, out_headers):
@@ -698,15 +780,30 @@ def main():
     fresh_rows = [r for r in todo if r["_normalized_url"] not in cache]
     print(f"Cached: {len(cached_rows)} | Fresh to scrape: {len(fresh_rows)}")
 
+    cached_stats = {"ok": 0, "fail": 0, "cf": 0, "dd": 0}
     for row in cached_rows:
-        write_success_row(row, cache[row["_normalized_url"]], output_path, out_headers)
+        cr = cache[row["_normalized_url"]]
+        status = cr.get("status", "")
+        if status in ("ok", "ok_js", "ok_basic"):
+            cached_stats["ok"] += 1
+        elif status == "cloudflare_blocked":
+            cached_stats["cf"] += 1
+        elif status == "dead_domain":
+            cached_stats["dd"] += 1
+        else:
+            cached_stats["fail"] += 1
+        write_success_row(row, cr, output_path, out_headers)
 
+    progress_path = os.path.join(folder, "progress.json")
+    scrape_start = time.time()
+
+    phase_stats_list = []
     if args.basic_mode:
         # --basic-mode: 3-phase cost-optimized flow.
         # PHASE 1: cheap basic scrape (autoparse=false, antibot=false,
         # no JS, no premium). ~$0.00013/request. CF blocks are folded
         # into failures so Phase 2 retries them with antibot=true.
-        n_successes_1, failures_1 = run_phase(
+        stats_1, failures_1 = run_phase(
             api_key, fresh_rows,
             concurrency=concurrency,
             js_render=False, premium=False, phase=1,
@@ -716,14 +813,15 @@ def main():
             autoparse=False, antibot=False,
             ok_status="ok_basic", cf_retryable=True,
             basic_mode=True,
+            progress_path=progress_path,
         )
+        phase_stats_list.append(stats_1)
 
         # PHASE 2: antibot retry on Phase 1 failures (autoparse=true,
         # antibot=true, no JS/premium). CF still retryable for Phase 3.
-        n_successes_2 = 0
         failures_2 = failures_1
         if failures_1 and not _stop_requested.is_set():
-            n_successes_2, failures_2 = run_phase(
+            stats_2, failures_2 = run_phase(
                 api_key, failures_1,
                 concurrency=min(30, concurrency),
                 js_render=False, premium=False, phase=2,
@@ -733,14 +831,15 @@ def main():
                 autoparse=True, antibot=True,
                 ok_status="ok", cf_retryable=True,
                 basic_mode=True,
+                progress_path=progress_path,
             )
+            phase_stats_list.append(stats_2)
 
         # PHASE 3: full-stack retry on Phase 2 failures (autoparse+antibot
         # +JS+premium). Last chance — CF here is cached permanent.
-        n_successes_3 = 0
         failures_final = failures_2
         if failures_2 and not _stop_requested.is_set():
-            n_successes_3, failures_final = run_phase(
+            stats_3, failures_final = run_phase(
                 api_key, failures_2,
                 concurrency=min(30, concurrency),
                 js_render=True, premium=True, phase=3,
@@ -750,37 +849,38 @@ def main():
                 autoparse=True, antibot=True,
                 ok_status="ok_js", cf_retryable=False,
                 basic_mode=True,
+                progress_path=progress_path,
             )
-
-        phase_successes = n_successes_1 + n_successes_2 + n_successes_3
+            phase_stats_list.append(stats_3)
     else:
         # Default 2-phase flow (unchanged from v3.0).
         # PHASE 1 (streaming writes — content is flushed to disk per-future)
-        n_successes_1, failures_1 = run_phase(
+        stats_1, failures_1 = run_phase(
             api_key, fresh_rows,
             concurrency=concurrency,
             js_render=False, premium=False, phase=1,
             cache=cache,
             output_path=output_path,
             out_headers=out_headers,
+            progress_path=progress_path,
         )
+        phase_stats_list.append(stats_1)
 
         # PHASE 2 removed in v3.0: same-settings retry never recovered rows.
 
         # PHASE 3: JS render + premium proxy on remaining failures.
-        n_successes_3 = 0
         failures_final = failures_1
         if failures_1 and not _stop_requested.is_set():
-            n_successes_3, failures_final = run_phase(
+            stats_3, failures_final = run_phase(
                 api_key, failures_1,
                 concurrency=min(25, concurrency),
                 js_render=True, premium=True, phase=3,
                 cache=cache,
                 output_path=output_path,
                 out_headers=out_headers,
+                progress_path=progress_path,
             )
-
-        phase_successes = n_successes_1 + n_successes_3
+            phase_stats_list.append(stats_3)
 
     for row in failures_final:
         row.update({
@@ -801,11 +901,32 @@ def main():
     _close_all_sessions()
     cache.close()
 
-    total_ok = len(cached_rows) + phase_successes
+    total_ok = cached_stats["ok"] + sum(s["ok"] for s in phase_stats_list)
+    total_dd = cached_stats["dd"] + sum(s["dd"] for s in phase_stats_list)
+    total_cf = cached_stats["cf"] + sum(s["cf"] for s in phase_stats_list)
     total_failed = len(failures_final)
-    print(
-        f"\nDone: Total OK: {total_ok} | Total Failed: {total_failed} | "
-        f"Saved to: {output_path}"
+    grand_total = total_ok + total_dd + total_cf + total_failed
+    elapsed_total = time.time() - scrape_start
+
+    def _pct(n):
+        return f"({100 * n / grand_total:.1f}%)" if grand_total else "(0.0%)"
+
+    elapsed_min = max(0, int(round(elapsed_total / 60)))
+    print()
+    print("✅ Scraping complete")
+    print(f"Total:   {grand_total:,}")
+    print(f"OK:      {f'{total_ok:,}':<8}{_pct(total_ok)}")
+    print(f"Failed:  {f'{total_failed:,}':<8}{_pct(total_failed)}")
+    print(f"DD:      {f'{total_dd:,}':<8}{_pct(total_dd)}")
+    print(f"CF:      {f'{total_cf:,}':<8}{_pct(total_cf)}")
+    print(f"Time:    {elapsed_min} min")
+    print(f"Output:  {output_path}")
+
+    _write_progress_json(
+        progress_path, phase=0, phase_label="complete",
+        done=grand_total, total=grand_total,
+        ok=total_ok, fail=total_failed, dd=total_dd, cf=total_cf,
+        start=scrape_start,
     )
 
 
