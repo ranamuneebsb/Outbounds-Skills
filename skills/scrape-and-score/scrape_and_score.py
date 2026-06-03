@@ -401,6 +401,71 @@ def load_icp(icp_arg: str) -> Tuple[str, str]:
     return "<inline>", icp_arg.strip()
 
 
+# An ICP shorter than this (word count) is treated as a quick description and
+# auto-expanded into a full scoring rubric before the run. At/above it, the ICP
+# is assumed already detailed and is used as-is.
+ICP_SHORT_WORD_THRESHOLD = 200
+
+ICP_EXPANSION_SYSTEM = """\
+You are an expert at writing ICP (Ideal Customer Profile) scoring rubrics for a
+B2B cold-outbound agency. You are given a short ICP description. Expand it into a
+complete, detailed scoring prompt that another LLM will use to score companies
+1-10 for fit against this ICP.
+
+Output a thorough ICP rubric containing ALL of these sections, in this order:
+
+1. DEFINITION — a precise statement of exactly who qualifies (the core-business
+   test). Make the boundary unambiguous.
+2. POSITIVE SIGNALS — concrete signals (on a website or in a description) that
+   indicate a fit.
+3. DISQUALIFIER SIGNALS — concrete signals that indicate this is NOT a fit.
+4. YES EXAMPLES — 3-5 example companies that clearly qualify. For each: a score
+   (7-10) and a one-line reason.
+5. NO EXAMPLES — 3-5 example companies that clearly do NOT qualify. For each: a
+   score (1-4) and a one-line reason.
+6. SCORING GUIDE (1-10) — what each band means specifically for THIS ICP.
+7. EDGE CASES TO WATCH FOR — look-alikes, hybrids, adjacent industries, and how
+   to handle each.
+
+Be specific and concrete to the exact industry/segment described — invent
+realistic example company names. Write clean plain-text / light markdown that
+can be dropped directly into a scoring system prompt. Output ONLY the rubric:
+no preamble, no commentary, no closing remarks.
+"""
+
+
+def expand_icp(icp_text: str, openrouter_key: str, model: str = DEFAULT_DESCRIPTION_MODEL) -> str:
+    """Call the cheap model ONCE to turn a short ICP blurb into a full scoring
+    rubric (definition, YES/NO examples, signals, scoring guide, edge cases)."""
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Bearer {openrouter_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/ranamuneebsb/Olympo-labs-skills",
+        "X-Title": "scrape-and-score icp-expand",
+    })
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": ICP_EXPANSION_SYSTEM},
+            {"role": "user", "content": (
+                f"Short ICP description:\n\n{icp_text.strip()}\n\n"
+                "Expand it into the full ICP scoring prompt described above."
+            )},
+        ],
+        "temperature": 0.4,
+        "max_tokens": 2000,
+    }
+    resp = session.post(OPENROUTER_ENDPOINT, json=body, timeout=120)
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenRouter HTTP {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    content = (data["choices"][0]["message"]["content"] or "").strip()
+    if not content:
+        raise RuntimeError("ICP expansion returned empty content")
+    return content
+
+
 # ================================================================
 # Scrape cache (SQLite) — caches BOTH successes and failures
 # ================================================================
@@ -933,6 +998,8 @@ def main() -> int:
     parser.add_argument("--description-only", action="store_true", help="Never scrape; score from description only")
     parser.add_argument("--force-rescore", action="store_true", help="Re-score rows already present in the output CSV")
     parser.add_argument("--skip-confirm", action="store_true", help="Skip the >1000-row cost confirmation prompt")
+    parser.add_argument("--skip-icp-confirm", action="store_true",
+                        help="Skip the expanded-ICP confirmation prompt (for unattended runs)")
     parser.add_argument("--max-rows", type=int, help="Cap rows processed (testing)")
     parser.add_argument("--csv-out", help="Output path (default <input>_scored.csv)")
     args = parser.parse_args()
@@ -960,6 +1027,42 @@ def main() -> int:
     progress_path = folder / "progress.json"
 
     icp_name, icp_def = load_icp(args.icp)
+
+    # ICP prompt builder: a short ICP (< 200 words) is auto-expanded by the
+    # cheap model into a full scoring rubric before the run; a detailed ICP
+    # (>= 200 words, e.g. a profile file) is used as-is.
+    word_count = len(icp_def.split())
+    if word_count < ICP_SHORT_WORD_THRESHOLD:
+        print(f"\nICP is short ({word_count} words < {ICP_SHORT_WORD_THRESHOLD}). "
+              f"Expanding it into a full scoring prompt with {DEFAULT_DESCRIPTION_MODEL}...")
+        try:
+            expanded = expand_icp(icp_def, args.openrouter_key)
+        except Exception as exc:
+            sys.stderr.write(f"ERROR: ICP expansion failed: {exc}\n")
+            return 5
+        print("\n" + "=" * 64)
+        print("EXPANDED ICP SCORING PROMPT")
+        print("=" * 64)
+        print(expanded)
+        print("=" * 64 + "\n")
+        if args.skip_icp_confirm:
+            print("(--skip-icp-confirm set: using the expanded ICP without asking)")
+        elif sys.stdin.isatty():
+            try:
+                ans = input("Does this ICP look correct? Press Y to continue or N to cancel: ").strip().lower()
+            except EOFError:
+                ans = "y"
+            if ans not in ("y", "yes"):
+                print("Cancelled. Refine your --icp text and re-run.")
+                return 0
+        else:
+            print("(non-interactive terminal: proceeding with the expanded ICP; "
+                  "pass --skip-icp-confirm to silence this note)")
+        icp_def = expanded
+        icp_name = f"{icp_name}+expanded"
+    else:
+        print(f"\nICP is detailed ({word_count} words >= {ICP_SHORT_WORD_THRESHOLD}); using it as-is.")
+
     in_headers, rows = read_csv(csv_in)
     if not rows:
         sys.stderr.write("ERROR: input CSV is empty.\n")

@@ -22,6 +22,38 @@ Claude Code DOWNLOADS and RUNS that file. It does NOT rewrite, regenerate,
 or "improve" it.
 
 ================================================================
+ICP PROMPT BUILDER (runs once, before scoring)
+================================================================
+You don't have to hand-write a detailed ICP. If the --icp value is SHORT
+(fewer than 200 words), the script auto-expands it into a full scoring
+rubric before the run:
+
+  1. You pass a short description, e.g.:
+       --icp "Personal injury law firms in the USA that represent injured
+              people on a contingency fee basis"
+  2. The script counts the words and sees it is under 200.
+  3. It calls gpt-4o-mini ONCE to expand it into a complete ICP scoring
+     prompt containing:
+       - a clear definition of who qualifies
+       - 3-5 YES examples with scores and reasons
+       - 3-5 NO examples with scores and reasons
+       - positive signals to look for
+       - disqualifier signals
+       - a 1-10 scoring guide
+       - edge cases to watch for
+  4. It prints the expanded prompt and asks:
+       "Does this ICP look correct? Press Y to continue or N to cancel"
+     (Press N to abort, refine your --icp text, and re-run.)
+  5. The expanded prompt is what gets used for ALL scoring in the run.
+
+If the --icp value is 200 words or more (typically an ICP profile .md
+file), it is used AS-IS and no expansion happens.
+
+Use --skip-icp-confirm to skip the confirmation prompt on unattended runs
+(the expanded ICP is used without asking). On a non-interactive terminal
+the script also proceeds automatically rather than hanging on input.
+
+================================================================
 WHAT IT DOES, IN PLAIN ENGLISH
 ================================================================
 For every row in the input CSV:
@@ -122,9 +154,11 @@ Positional:
                            Windows: D:/folder/input.csv).
 
 Required:
-  --icp PATH_OR_TEXT       Path to an ICP profile (.md/.txt). If the value
-                           is not an existing file it is treated as inline
-                           ICP text.
+  --icp PATH_OR_TEXT       Path to an ICP profile (.md/.txt) OR inline ICP
+                           text. If the value is under 200 words it is
+                           auto-expanded into a full scoring rubric by
+                           gpt-4o-mini before the run (see ICP PROMPT
+                           BUILDER above); 200+ words is used as-is.
   --openrouter-key KEY     OpenRouter API key.
   --zenrows-key KEY        ZenRows API key (omit only with --no-zenrows
                            or --description-only).
@@ -151,6 +185,8 @@ Mode (default is description-first hybrid):
 Run control:
   --force-rescore           Re-score rows already present in the output CSV.
   --skip-confirm            Skip the >1000-row cost confirmation prompt.
+  --skip-icp-confirm        Skip the expanded-ICP confirmation prompt
+                            (unattended runs use the expanded ICP as-is).
   --max-rows N              Cap rows processed (testing).
   --csv-out PATH            Override the output path.
 
@@ -228,6 +264,22 @@ Score a Clay export against a saved ICP, default threshold 7:
       --concurrency 50 \
       --score-threshold 7
 
+Short inline ICP — auto-expanded into a full rubric, then confirmed (Y/N):
+
+    python scrape_and_score.py "D:/leads/list.csv" \
+      --icp "Personal injury law firms in the USA that represent injured \
+             people on a contingency fee basis" \
+      --openrouter-key sk-or-v1-xxxx \
+      --zenrows-key zr-xxxx
+
+Same, but unattended (skip the expanded-ICP confirmation prompt):
+
+    python scrape_and_score.py "D:/leads/list.csv" \
+      --icp "Dental practices in the US offering cosmetic dentistry" \
+      --openrouter-key sk-or-v1-xxxx \
+      --zenrows-key zr-xxxx \
+      --skip-icp-confirm
+
 Free-httpx-only (no ZenRows spend), inline ICP, lower threshold:
 
     python scrape_and_score.py "D:/leads/list.csv" \
@@ -258,4 +310,7 @@ NOTES FOR CLAUDE CODE
   - Use forward slashes in paths on the command line.
   - Always pass --openrouter-key and --zenrows-key as arguments. Never
     hardcode them, never read them from the environment or saved files.
+  - If the user passes a short --icp, the script expands it and (on an
+    interactive terminal) asks Y/N before scoring. Show the user the
+    expanded ICP. For a hands-off run, pass --skip-icp-confirm.
   - Auto-installs httpx, html2text, requests, and tqdm if missing.
