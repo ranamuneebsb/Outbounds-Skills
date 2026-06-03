@@ -21,11 +21,12 @@ Description-first hybrid pipeline. For every company row in a CSV:
                                                         js_render=true. Final attempt;
                                                         if it fails -> scrape_failed.
 
-Scoring logic is taken verbatim from Bryan's company-scoring skill (same prompts,
-same 1-10 rubric, same borderline escalation):
+Scoring logic uses Bryan's company-scoring prompts and 1-10 rubric verbatim:
   - gpt-4o-mini                      description screening
   - deepseek/deepseek-chat-v3.1      scrape scoring
-  - anthropic/claude-sonnet-4-6      borderline escalation (score 5-7, weak confidence)
+There is NO escalation model. Scores are final after description or scrape
+scoring. (An advanced --escalation-model flag exists for power users; when
+omitted — the default — no escalation ever happens.)
 
 Speed: async scraping (httpx.AsyncClient, conc 50 free / 30 ZenRows), LLM calls on
 a 30-worker thread pool, rows scored the moment they're scraped, results streamed
@@ -100,7 +101,6 @@ csv.field_size_limit(10**9)
 
 DEFAULT_DESCRIPTION_MODEL = "openai/gpt-4o-mini"
 DEFAULT_SCRAPE_MODEL = "deepseek/deepseek-chat-v3.1"
-DEFAULT_ESCALATION_MODEL = "anthropic/claude-sonnet-4-6"
 
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 ZENROWS_ENDPOINT = "https://api.zenrows.com/v1/"
@@ -453,7 +453,8 @@ class Runner:
         self.desc_sys = build_description_system(icp_def)
         self.scrape_sys = build_scrape_system(icp_def)
         self.threshold = args.score_threshold
-        self.escalate = not args.no_escalation
+        # Escalation is OFF unless the user explicitly passes --escalation-model.
+        self.escalate = bool(args.escalation_model)
         self.use_zenrows = not args.no_zenrows
 
         # Concurrency primitives
@@ -637,24 +638,8 @@ class Runner:
                 return self._error(f"description-mode LLM error: {exc}")
 
             if not bool(r.get("needs_scrape")):
-                # Clear enough to score from the description — NO scraping...
-                if self.args.description_only:
-                    return self._build(r, "description", "", "", "")
-                # ...unless it's a borderline 5-7 with weak confidence and
-                # escalation is on (Bryan's logic: verify with a scrape + smart model).
-                score = safe_int_score(r.get("score")) or 0
-                conf = str(r.get("confidence", "")).lower()
-                if self.escalate and ESCALATION_SCORE_LOWER <= score <= ESCALATION_SCORE_UPPER \
-                        and conf in ("low", "medium") and url:
-                    content, status, phase = await self.scrape(url)
-                    if content:
-                        try:
-                            r2 = await self.call_llm(self.args.escalation_model, self.scrape_sys,
-                                                     scrape_user_prompt(name, domain, content), 400)
-                            return self._build(r2, "description+escalation", content, status, phase)
-                        except Exception:
-                            return self._build(r, "description", content, status, phase)
-                    return self._build(r, "description", content, status, phase)
+                # Clear enough to score from the description — NO scraping. The
+                # description score is final (no borderline escalation scrape).
                 return self._build(r, "description", "", "", "")
 
             # needs_scrape == true
@@ -680,16 +665,19 @@ class Runner:
         except Exception as exc:
             return self._error(f"scrape-mode LLM error: {exc}", content, status, phase)
 
-        # Escalation: borderline 5-7 with weak confidence -> smart model, same text.
-        score = safe_int_score(r.get("score")) or 0
-        conf = str(r.get("confidence", "")).lower()
-        if self.escalate and ESCALATION_SCORE_LOWER <= score <= ESCALATION_SCORE_UPPER \
-                and conf in ("low", "medium"):
-            try:
-                r = await self.call_llm(self.args.escalation_model, self.scrape_sys,
-                                        scrape_user_prompt(name, domain, content), 400)
-            except Exception:
-                pass
+        # Advanced opt-in only: when --escalation-model is explicitly passed,
+        # re-score borderline 5-7 / weak-confidence rows with that model on the
+        # SAME scraped text (no new scrape). Off by default — the scrape score
+        # is final.
+        if self.escalate:
+            score = safe_int_score(r.get("score")) or 0
+            conf = str(r.get("confidence", "")).lower()
+            if ESCALATION_SCORE_LOWER <= score <= ESCALATION_SCORE_UPPER and conf in ("low", "medium"):
+                try:
+                    r = await self.call_llm(self.args.escalation_model, self.scrape_sys,
+                                            scrape_user_prompt(name, domain, content), 400)
+                except Exception:
+                    pass
         return self._build(r, "scrape", content, status, phase)
 
 
@@ -771,7 +759,6 @@ def estimate_and_confirm(pending: int, args) -> bool:
     print(f"  Rows to process:        {pending:,}")
     print(f"  Description screen:     {args.description_model} (~{desc_in}/{desc_out} tok)")
     print(f"  Scrape scoring:         {args.scrape_model}")
-    print(f"  Escalation:             {args.escalation_model} ({'on' if not args.no_escalation else 'off'})")
     print(f"  Assumptions:            ~{int(assumed_scrape_rate*100)}% of rows scrape, "
           f"~{int(assumed_httpx_free*100)}% of those free via httpx")
     print(f"  Est. LLM cost:          ${llm_est:,.2f}")
@@ -937,8 +924,10 @@ def main() -> int:
                         help="Score >= threshold => Qualified (default 7)")
     parser.add_argument("--description-model", default=DEFAULT_DESCRIPTION_MODEL)
     parser.add_argument("--scrape-model", default=DEFAULT_SCRAPE_MODEL)
-    parser.add_argument("--escalation-model", default=DEFAULT_ESCALATION_MODEL)
-    parser.add_argument("--no-escalation", action="store_true", help="Disable borderline 5-7 escalation")
+    parser.add_argument("--escalation-model", default=None,
+                        help="ADVANCED (optional): re-score borderline 5-7 / weak-confidence "
+                             "scraped rows with this model on the same scraped text. Omitted by "
+                             "default => no escalation ever happens; scores are final.")
     parser.add_argument("--no-zenrows", action="store_true", help="Free httpx only; never call ZenRows")
     parser.add_argument("--scrape-only", action="store_true", help="Scrape+score every row; skip the description path")
     parser.add_argument("--description-only", action="store_true", help="Never scrape; score from description only")

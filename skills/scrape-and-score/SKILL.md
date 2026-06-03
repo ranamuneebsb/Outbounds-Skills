@@ -9,13 +9,13 @@ company's description and decides whether that is enough to score. Only
 when the description is missing, thin, vague, or contradicts ICP keywords
 in the company name does it scrape the website — and even then it tries a
 FREE httpx fetch before spending a single ZenRows credit. Scraped pages
-are scored by a stronger model, with smart-model escalation on the
-borderline 5-7 band.
+are scored by a stronger model. There is NO escalation model — scores are
+final after description or scrape scoring.
 
 This skill merges three earlier skills:
   - zenrows-scraper   (the httpx -> ZenRows scrape ladder + html2text)
   - icp-classifier    (CSV in / scored CSV + qualified CSV out)
-  - company-scoring   (Bryan's exact prompts, 1-10 rubric, escalation)
+  - company-scoring   (Bryan's exact prompts and 1-10 rubric)
 
 The script is already implemented as scrape_and_score.py in this repo.
 Claude Code DOWNLOADS and RUNS that file. It does NOT rewrite, regenerate,
@@ -79,19 +79,18 @@ Scraping is triggered when the description screen returns
     description would otherwise lead to a disqualify (highest-value case
     to verify by scraping).
 
-Otherwise the row is scored straight from the description with no scrape.
-One nuance (inherited from company-scoring): if a description-only score
-lands in the borderline 5-7 band with low/medium confidence and escalation
-is enabled, the row is scraped once and re-scored by the smart model to
-break the tie. Pass --no-escalation to disable that.
+Otherwise the row is scored straight from the description with no scrape,
+and that score is final. There is no escalation model: a clear description
+score is never re-checked by scraping, and a scrape score is never
+re-scored by a second model.
 
 ================================================================
 SCORING MODELS (Bryan's company-scoring logic, used exactly)
 ================================================================
   - Description screening:  openai/gpt-4o-mini
   - Scrape scoring:         deepseek/deepseek-chat-v3.1
-  - Borderline escalation:  anthropic/claude-sonnet-4-6
-      (fires when a score is 5-7 with low/medium confidence)
+
+No escalation model. Scores are final after description or scrape scoring.
 
 Verdict: score >= threshold (default 7) => Qualified, else Disqualified.
 Same 1-10 rubric and the same description/scrape system prompts as the
@@ -139,8 +138,10 @@ Scoring:
   --score-threshold N      Score >= N => Qualified. Default 7.
   --description-model M     Default openai/gpt-4o-mini.
   --scrape-model M          Default deepseek/deepseek-chat-v3.1.
-  --escalation-model M      Default anthropic/claude-sonnet-4-6.
-  --no-escalation           Disable borderline 5-7 escalation.
+  --escalation-model M      ADVANCED, optional. Off by default. When set, it
+                            re-scores borderline 5-7 / weak-confidence SCRAPED
+                            rows with model M on the same scraped text (no new
+                            scrape). Omit it and no escalation ever happens.
 
 Mode (default is description-first hybrid):
   --scrape-only             Scrape + score every row; skip the description path.
@@ -186,7 +187,6 @@ Rough rules of thumb:
   - A row scored from description only:        ~$0.0003
   - A row that scrapes (free httpx) + scores:  ~$0.001-0.002
   - A row that needs ZenRows + scores:         ~$0.003-0.006
-  - An escalated borderline row adds:          ~$0.005 (Sonnet)
 
 ================================================================
 OUTPUT FILES (all written next to the input CSV)
@@ -201,8 +201,8 @@ OUTPUT FILES (all written next to the input CSV)
    scrape_failed, or empty (scored from description, never scraped).
    scrape_phase: 0 (httpx), 1 (ZenRows basic), 2 (ZenRows antibot+JS),
    or empty.
-   Scoring Source: description, description+escalation, scrape,
-   scrape_failed, description_thin (--description-only), or failed.
+   Scoring Source: description, scrape, scrape_failed,
+   description_thin (--description-only), or failed.
 
 2. <input>_qualified.csv
    Only rows with ICP Score >= threshold (default 7). Regenerated from the
