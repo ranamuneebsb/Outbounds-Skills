@@ -1,6 +1,11 @@
 """
-ZenRows Website Scraper - 3-phase cost-optimized flow.
+ZenRows Website Scraper - 4-phase cost-optimized flow (httpx Tier 0 + ZenRows).
 
+  Phase 0 (FREE) at user concurrency:
+    Plain httpx GET (12s timeout, follows redirects, rotating UA). If the
+    site returns HTTP 200 with non-thin readable text it's used as-is and
+    ZenRows is skipped entirely. Anything that fails/non-200/thin falls
+    through to Phase 1. Typically clears ~65% of domains for $0.
   Phase 1 at user concurrency (default 30, hard cap 40):
     autoparse=false, antibot=false, js_render=false, premium_proxy=false.
     Cost: $0.00013 per request. CF blocks here are retried in Phase 2.
@@ -11,6 +16,9 @@ ZenRows Website Scraper - 3-phase cost-optimized flow.
     autoparse=true, antibot=true, js_render=true, premium_proxy=true.
   Anything still failing after Phase 3 is marked scrape_failed.
 
+All scraped content (httpx and ZenRows) is run through html2text so
+homepage_content always holds clean readable text, never raw HTML.
+
 See SKILL.md for the full spec and operational rules
 (15-minute restart cooldown, source-of-truth cache, etc).
 """
@@ -18,6 +26,7 @@ import argparse
 import csv
 import json
 import os
+import random
 import signal
 import sqlite3
 import sys
@@ -28,14 +37,29 @@ from urllib.parse import urlparse
 
 import requests
 
+
+def _pip_install(pkg):
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+
+
 try:
     from tqdm import tqdm
 except ImportError:
-    import subprocess
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "tqdm", "-q"]
-    )
+    _pip_install("tqdm")
     from tqdm import tqdm
+
+try:
+    import httpx
+except ImportError:
+    _pip_install("httpx")
+    import httpx
+
+try:
+    import html2text
+except ImportError:
+    _pip_install("html2text")
+    import html2text
 
 csv.field_size_limit(sys.maxsize)
 
@@ -59,6 +83,49 @@ ZENROWS_ENDPOINT = "https://api.zenrows.com/v1/"
 MAX_CONCURRENCY = 40
 COOLDOWN_SECONDS = 15 * 60
 LAST_RUN_FILENAME = ".zenrows_last_run"
+
+# Tier 0 (Phase 0) free httpx fetch settings.
+HTTPX_TIMEOUT = 12          # seconds
+HTTPX_MIN_TEXT = 200        # min clean-text chars to accept; below = thin -> ZenRows
+MAX_HTML_BYTES = 500 * 1024  # cap HTML before html2text to avoid CPU spin
+
+# Rotating user agents shared by the httpx Tier 0 fetch. A spread of recent
+# desktop/mobile browsers so plain GETs look like organic traffic.
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+]
+
+
+def html_to_text(html):
+    """Convert raw HTML to clean readable text via html2text.
+
+    Applied to ALL scraped content (httpx Tier 0 and every ZenRows phase) so
+    homepage_content never holds raw HTML. HTML is capped at MAX_HTML_BYTES
+    before conversion to stop html2text spinning on huge pages. Falls back to
+    the (capped) input on any converter error so we never lose content.
+    """
+    if not html:
+        return ""
+    if len(html) > MAX_HTML_BYTES:
+        html = html[:MAX_HTML_BYTES]
+    try:
+        h = html2text.HTML2Text()
+        h.ignore_links = True
+        h.ignore_images = True
+        h.ignore_emphasis = True
+        h.body_width = 0
+        return h.handle(html).strip()
+    except Exception:
+        return html.strip()
 
 
 # Graceful-shutdown state. Workers check _stop_requested between requests;
@@ -197,6 +264,39 @@ def is_dead_domain(response):
     return True
 
 
+def scrape_one_httpx(url):
+    """Tier 0 (Phase 0): free plain httpx GET. Returns (status, content, err).
+
+    status is "ok", "failed", or "stopped". A plain GET (12s timeout, follows
+    redirects, rotating UA) clears a large share of sites for $0. Content is
+    cleaned with html_to_text and accepted only if it yields >= HTTPX_MIN_TEXT
+    chars of readable text — non-200, errors, empty, or thin pages return
+    "failed" so the caller falls through to ZenRows Phase 1. ZenRows is never
+    touched here, so cloudflare_blocked / dead_domain verdicts don't apply.
+    """
+    if _stop_requested.is_set():
+        return "stopped", "", "shutdown requested"
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
+    try:
+        r = httpx.get(
+            url,
+            timeout=HTTPX_TIMEOUT,
+            follow_redirects=True,
+            headers=headers,
+        )
+    except Exception as e:
+        return "failed", "", f"httpx: {e}"
+    if r.status_code != 200:
+        return "failed", "", f"httpx HTTP {r.status_code}"
+    raw = r.text or ""
+    if not raw.strip():
+        return "failed", "", "httpx empty body"
+    content = html_to_text(raw)
+    if len(content.strip()) < HTTPX_MIN_TEXT:
+        return "failed", "", "httpx thin content"
+    return "ok", content, None
+
+
 def scrape_one(url, api_key, phase_settings, session_local, timeout=30):
     """Returns (status, content, error_or_None).
 
@@ -260,6 +360,9 @@ def scrape_one(url, api_key, phase_settings, session_local, timeout=30):
             content = r.text or ""
             if not content.strip():
                 return "failed", "", "empty response"
+            content = html_to_text(content)
+            if not content.strip():
+                return "failed", "", "empty after html2text"
             return "ok", content, None
         except requests.exceptions.SSLError as e:
             if not tried_no_verify:
@@ -272,7 +375,9 @@ def scrape_one(url, api_key, phase_settings, session_local, timeout=30):
                         verify=False,
                     )
                     if r.status_code == 200 and r.text and r.text.strip():
-                        return "ok", r.text, None
+                        cleaned = html_to_text(r.text)
+                        if cleaned.strip():
+                            return "ok", cleaned, None
                 except Exception as e2:
                     last_err = f"ssl-retry: {e2}"
                     break
@@ -379,11 +484,13 @@ def append_output(output_path, headers, row):
 
 def _phase_style(phase):
     """Return (tqdm colour, descriptive label) for a phase."""
+    if phase == 0:
+        return "green", "Phase 0: httpx (free)"
     if phase == 1:
-        return "blue", "Phase 1: Scraping"
+        return "blue", "Phase 1: ZenRows basic"
     if phase == 2:
-        return "yellow", "Phase 2: Antibot retry"
-    return "red", "Phase 3: JS retry"
+        return "yellow", "Phase 2: ZenRows antibot"
+    return "red", "Phase 3: ZenRows JS render"
 
 
 def _postfix_str(ok, fail, dd, cf, done, total, elapsed):
@@ -406,7 +513,7 @@ def _postfix_str(ok, fail, dd, cf, done, total, elapsed):
 
 
 def _write_progress_json(progress_path, phase, phase_label, done, total,
-                         ok, fail, dd, cf, start):
+                         ok, fail, dd, cf, start, **extra):
     if not progress_path:
         return
     elapsed = time.time() - start
@@ -426,6 +533,7 @@ def _write_progress_json(progress_path, phase, phase_label, done, total,
         "speed_per_min": int(round(rate_per_sec * 60)),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    data.update(extra)
     try:
         tmp_path = progress_path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -448,7 +556,7 @@ def run_phase(api_key, rows, concurrency, js_render, premium, phase, cache,
               output_path, out_headers, *,
               autoparse=True, antibot=True,
               ok_status=None, cf_retryable=False,
-              progress_path=None):
+              progress_path=None, fetcher=None):
     """Streaming-writes variant: calls write_success_row inline as each future
     completes so HTML content doesn't accumulate in memory. Returns
     (stats_dict, failures). stats_dict has keys ok, fail, cf, dd, elapsed.
@@ -490,9 +598,13 @@ def run_phase(api_key, rows, concurrency, js_render, premium, phase, cache,
 
     def task(row):
         url = row["_normalized_url"]
-        status, content, err = scrape_one(
-            url, api_key, phase_settings, session_local
-        )
+        if fetcher is not None:
+            # Tier 0 httpx fetch — no ZenRows session / phase settings.
+            status, content, err = fetcher(url)
+        else:
+            status, content, err = scrape_one(
+                url, api_key, phase_settings, session_local
+            )
         return row, url, status, content, err
 
     pbar = tqdm(
@@ -762,7 +874,7 @@ def main():
     for row in cached_rows:
         cr = cache[row["_normalized_url"]]
         status = cr.get("status", "")
-        if status in ("ok", "ok_js", "ok_basic"):
+        if status in ("ok", "ok_js", "ok_basic", "ok_httpx"):
             cached_stats["ok"] += 1
         elif status == "cloudflare_blocked":
             cached_stats["cf"] += 1
@@ -776,21 +888,50 @@ def main():
     scrape_start = time.time()
 
     phase_stats_list = []
-    # PHASE 1: cheap basic scrape (autoparse=false, antibot=false,
-    # no JS, no premium). ~$0.00013/request. CF blocks are folded
-    # into failures so Phase 2 retries them with antibot=true.
-    stats_1, failures_1 = run_phase(
+    # PHASE 0: FREE httpx fetch. Successes are cleaned with html2text and
+    # written straight to cache/output — ZenRows is skipped for them. Only
+    # the httpx failures (non-200/error/thin) fall through to Phase 1.
+    stats_0, httpx_failures = run_phase(
         api_key, fresh_rows,
         concurrency=concurrency,
-        js_render=False, premium=False, phase=1,
+        js_render=False, premium=False, phase=0,
         cache=cache,
         output_path=output_path,
         out_headers=out_headers,
         autoparse=False, antibot=False,
-        ok_status="ok_basic", cf_retryable=True,
+        ok_status="ok_httpx", cf_retryable=True,
         progress_path=progress_path,
+        fetcher=scrape_one_httpx,
     )
-    phase_stats_list.append(stats_1)
+    phase_stats_list.append(stats_0)
+    httpx_ok = stats_0["ok"]
+    httpx_failed = stats_0["fail"]
+    httpx_total = httpx_ok + httpx_failed
+    httpx_rate = (100.0 * httpx_ok / httpx_total) if httpx_total else 0.0
+    print(
+        f"Phase 0 (httpx free): {httpx_ok:,} OK | {httpx_failed:,} fell "
+        f"through to ZenRows | hit rate {httpx_rate:.1f}%",
+        flush=True,
+    )
+
+    # PHASE 1: cheap basic scrape (autoparse=false, antibot=false,
+    # no JS, no premium). ~$0.00013/request. Runs only on httpx failures.
+    # CF blocks are folded into failures so Phase 2 retries with antibot=true.
+    failures_1 = httpx_failures
+    stats_1 = {"ok": 0, "fail": 0, "cf": 0, "dd": 0, "elapsed": 0.0}
+    if httpx_failures and not _stop_requested.is_set():
+        stats_1, failures_1 = run_phase(
+            api_key, httpx_failures,
+            concurrency=concurrency,
+            js_render=False, premium=False, phase=1,
+            cache=cache,
+            output_path=output_path,
+            out_headers=out_headers,
+            autoparse=False, antibot=False,
+            ok_status="ok_basic", cf_retryable=True,
+            progress_path=progress_path,
+        )
+        phase_stats_list.append(stats_1)
 
     # PHASE 2: antibot retry on Phase 1 failures (autoparse=true,
     # antibot=true, no JS/premium). CF still retryable for Phase 3.
@@ -865,12 +1006,19 @@ def main():
     print(f"CF:      {f'{total_cf:,}':<8}{_pct(total_cf)}")
     print(f"Time:    {elapsed_min} min")
     print(f"Output:  {output_path}")
+    print()
+    print("Phase 0 — httpx (free) tier:")
+    print(f"  httpx OK:       {f'{httpx_ok:,}':<8}fetched free, ZenRows skipped")
+    print(f"  httpx failed:   {f'{httpx_failed:,}':<8}fell through to ZenRows")
+    print(f"  httpx hit rate: {httpx_rate:.1f}% of fresh domains for $0")
 
     _write_progress_json(
         progress_path, phase=0, phase_label="complete",
         done=grand_total, total=grand_total,
         ok=total_ok, fail=total_failed, dd=total_dd, cf=total_cf,
         start=scrape_start,
+        httpx_ok=httpx_ok, httpx_failed=httpx_failed,
+        httpx_hit_rate=round(httpx_rate, 1),
     )
 
 

@@ -1,20 +1,31 @@
 SKILL NAME: ZenRows Website Scraper
-VERSION: 4.0
+VERSION: 5.0
 AUTHOR: OlympoLabs
 
 DESCRIPTION:
-Scrapes homepage content for every company in a CSV using the
-ZenRows API. Auto-detects website and company name columns.
+Scrapes homepage content for every company in a CSV. Tries a FREE
+plain-httpx fetch first, then falls back to the ZenRows API only for
+domains httpx can't get. Auto-detects website and company name columns.
+All scraped content (httpx and ZenRows) is run through html2text, so
+homepage_content always holds clean readable text — never raw HTML.
 
-Single 3-phase cost-optimized flow:
-- Phase 1: cheap basic request (autoparse=false, antibot=false,
-  js_render=false, premium_proxy=false), $0.00013 per request,
-  concurrency 30 (default, hard cap 40).
-- Phase 2: retry Phase 1 failures with autoparse=true, antibot=true
-  (still no JS, no premium) at concurrency 25.
-- Phase 3: retry Phase 2 failures with full stack — autoparse=true,
-  antibot=true, js_render=true, premium_proxy=true — at concurrency
-  25. Anything still failing is marked scrape_failed.
+4-phase cost-optimized flow (Phase 0 is free, Phases 1-3 are paid):
+- Phase 0: httpx + html2text (FREE, ~65% success rate). Plain GET
+  with a 12s timeout, follows redirects, rotating user agents. HTTP
+  200 with non-thin readable text is used as-is and ZenRows is
+  skipped. Anything that fails / is non-200 / is thin falls through
+  to Phase 1. Runs at the user concurrency (default 30).
+- Phase 1: ZenRows basic — cheap request (autoparse=false,
+  antibot=false, js_render=false, premium_proxy=false), $0.00013 per
+  request, concurrency 30 (default, hard cap 40). Runs on httpx
+  failures only.
+- Phase 2: ZenRows antibot — retry Phase 1 failures with
+  autoparse=true, antibot=true (still no JS, no premium) at
+  concurrency 25.
+- Phase 3: ZenRows JS render — retry Phase 2 failures with full
+  stack — autoparse=true, antibot=true, js_render=true,
+  premium_proxy=true — at concurrency 25. Anything still failing is
+  marked scrape_failed.
 
 The scraper is already implemented as scraper.py in this repo.
 Claude Code DOWNLOADS and RUNS that file. It does NOT rewrite,
@@ -186,9 +197,17 @@ WHAT THE SCRIPT DOES (reference only — do not reimplement)
 ================================================================
 - Auto-detects website and company columns from CSV headers.
 - Normalizes URLs (adds https://, strips www., strips trailing /).
-- 3-phase flow (see "PHASES" section below for full settings):
-  - Phase 1: cheap basic scrape at user concurrency (default 30).
-    CF blocks here are NOT permanent — they go to Phase 2.
+- Converts every scraped page (httpx AND ZenRows) to clean text
+  with html2text (ignore_links/images/emphasis, body_width=0).
+  HTML is capped at 500 KB before conversion to avoid CPU spin.
+  homepage_content is always readable text, never raw HTML.
+- 4-phase flow (see "PHASES" section below for full settings):
+  - Phase 0: FREE httpx fetch at user concurrency. HTTP 200 with
+    non-thin text is used as-is and ZenRows is skipped. Failures
+    fall through to Phase 1. ~65% typically clear here for $0.
+  - Phase 1: ZenRows cheap basic scrape on httpx failures at user
+    concurrency (default 30). CF blocks here are NOT permanent —
+    they go to Phase 2.
   - Phase 2: antibot retry on Phase 1 failures at concurrency 25.
     CF blocks here go to Phase 3.
   - Phase 3: full-stack JS+premium retry on Phase 2 failures at
@@ -232,22 +251,45 @@ the user can see the live progress bar.
 The scraper prints (CF folded into "Failed" in Phases 1 & 2 so
 the next phase can retry it with stronger settings):
 
-    Phase 1: Scraping X/Y | OK: A | DD: B | Failed: C | ETA: Xmin
-    Phase 2: Antibot retry X rows | New OK: A | Still failed: B
-    Phase 3: JS retry X rows | New OK: A | Final failed: B
+    Phase 0: httpx (free)    X/Y | OK: A | Failed: C | ETA: Xmin
+    Phase 1: ZenRows basic   X/Y | OK: A | DD: B | Failed: C | ETA
+    Phase 2: ZenRows antibot X rows | New OK: A | Still failed: B
+    Phase 3: ZenRows JS render X rows | New OK: A | Final failed: B
+    Phase 0 (httpx free): A OK | C fell through to ZenRows |
+      hit rate Z%
     Done: Total OK: X | Total Failed: Y | Saved to: [path]
 
+The tqdm bar is coloured per phase: green (Phase 0 httpx), blue
+(Phase 1 basic), yellow (Phase 2 antibot), red (Phase 3 JS).
+
 CF = cloudflare_blocked, DD = dead_domain. Only Phase 3 caches
-CF as a permanent verdict. DD is permanent in every phase.
+CF as a permanent verdict. DD is permanent in every phase. Phase 0
+never produces CF/DD (no ZenRows), only OK or Failed.
+
+httpx stats: the per-run summary and progress.json report
+`httpx_ok` (domains fetched free), `httpx_failed` (domains that
+fell through to ZenRows), and the httpx hit rate %.
 
 ================================================================
 PHASES
 ================================================================
-The site list is run through three phases. Phase 1 trades
-robustness for ~10x lower per-request cost; the two later phases
-recover anything Phase 1 missed.
+The site list is run through four phases. Phase 0 (free httpx)
+clears the easy majority of domains for $0; Phase 1 trades
+robustness for ~10x lower per-request cost on the rest; the two
+later phases recover anything Phase 1 missed.
 
-PHASE 1 — cheap basic scrape
+PHASE 0 — free httpx fetch + html2text
+  Plain httpx GET. Timeout 12s, follow_redirects=True, rotating
+  user agent (10 recent desktop/mobile UAs). Runs at the user
+  concurrency (default 30, hard cap 40). The raw HTML is converted
+  with html2text and accepted only if it yields >= 200 chars of
+  readable text. HTTP 200 + non-thin text → used as-is, ZenRows
+  skipped entirely; homepage_status is `ok_httpx`. Non-200,
+  network error, empty, or thin → the row falls through to Phase 1.
+  Cost: $0. Typical success rate ~65%. No ZenRows call is made, so
+  cloudflare_blocked / dead_domain verdicts cannot occur here.
+
+PHASE 1 — ZenRows cheap basic scrape (httpx failures only)
   autoparse=false, antibot=false, js_render=false,
   premium_proxy=false. Concurrency 30 (default, clamps to
   --concurrency if specified, hard cap 40). Cost: $0.00013 per
@@ -272,7 +314,8 @@ PHASE 3 — full-stack retry
   homepage_status for OKs from this phase is `ok_js`.
 
 Notes:
-- The cache phase column stores 1, 2, or 3 — useful for telling
+- The cache phase column stores 0, 1, 2, or 3 — phase 0 = free
+  httpx, useful for telling httpx rows from ZenRows rows and
   raw-HTML Phase-1 rows from autoparsed Phase-2/3 rows.
 - dead_domain is detected and cached permanent in every phase
   (it's a ZenRows verdict, not affected by antibot/JS).
