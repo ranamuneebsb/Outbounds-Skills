@@ -1,0 +1,17 @@
+# ============================================================================
+# FORMAT REFERENCE ONLY — NOT A DEFAULT. The pipeline NEVER reads this file.
+# The user supplies their OWN keyword file every run (--keywords PATH). Never
+# reuse, assume, or invent keywords from a previous campaign. If keywords are
+# missing, ASK the user for them.
+# ============================================================================
+#
+# FORMAT: one PARENT keyword per line. Blank lines and #comments are ignored.
+# Keep parents broad — dedupe + ICP classify do the narrowing. apify_scrape.py
+# fires one Apify run per line, across the --countries you pass.
+#
+# Shape (replace with the user's actual keywords each run):
+#
+# <parent keyword 1>
+# <parent keyword 2>
+# <parent keyword 3>
+# ...
