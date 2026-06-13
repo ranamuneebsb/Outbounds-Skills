@@ -1,0 +1,17 @@
+{
+  "_comment": "EXAMPLE ONLY - these are the Design Desk 'noble causes' rules. REPLACE per client. classify_ntee.py reads this file; nothing here is a default. NTEE reference: https://nccs.urban.org/project/national-taxonomy-exempt-entities-ntee-codes",
+  "_letter_meanings": {
+    "good": "C=environment D=animals E=health F=mental-health G=disease K=food L=housing M=disaster/rescue O=youth P=human-services Q=international-relief X=religion",
+    "drop": "A=arts B=education(K-12 rescued via override) H=medical-research I=crime/legal J=employment N=sports R=advocacy/political S=community T=foundations U=research V=? W=public/societal Y=mutual-benefit Z=unknown"
+  },
+  "good_letters": "CDEFGKLMOPQX",
+  "drop_letters": "ABHIJNRSTUVWYZ",
+  "drop_override_code3": ["E20", "E21", "E22", "E24", "E11", "E12", "Q20", "Q21", "Q22", "Q23"],
+  "_drop_override_note": "hospitals/hospital systems (E20-24), institutional healthcare foundations (E11-12), international exchange/diplomacy keep-relief-only (Q20-23)",
+  "drop_suffixes": ["01", "02", "03", "05"],
+  "_drop_suffixes_note": "any code3 ending in these = alliance/advocacy/professional/research-support org, dropped across ALL letters",
+  "keep_override_code3": ["B20", "B21", "B24", "B28"],
+  "_keep_override_note": "K-12 / preschool / special-needs schools rescued from the B drop-letter; higher-ed (B40-B50) and alumni (B84) stay dropped",
+  "blank_ntee": { "foundation_keep": ["10"] },
+  "_blank_ntee_note": "rows with no NTEE code: keep as good_feel only if FOUNDATION is in this list (10 = church by definition); all other blank-NTEE rows go to the no_ntee file (kept, never dropped)"
+}
