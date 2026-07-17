@@ -1,0 +1,15 @@
+{
+  "name": "conference-scraper",
+  "version": "1.0.0",
+  "description": "Multi-platform conference exhibitor/sponsor scraper. See README.md.",
+  "type": "commonjs",
+  "scripts": {
+    "postinstall": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
